@@ -1,0 +1,123 @@
+name: Backmerge
+
+# マージキュー(squash)を経由するとバックマージのマージコミットが潰れて
+# main と develop が再び乖離してしまう。そこで backmerge ラベルが付いた
+# main -> develop の PR は、bypass 権限を持つ GitHub App のトークンで
+# REST の merge エンドポイントを merge_method=merge で直接叩き、
+# キューを経由せずにマージコミットとして取り込む。
+
+on:
+  pull_request:
+    types: [labeled]
+
+# ワークフロー既定の GITHUB_TOKEN は使わない（マージは App トークンで実行）。
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: backmerge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  backmerge:
+    # backmerge ラベルが付き、かつ main -> develop の PR のときだけ実行
+    if: >
+      github.event.label.name == 'backmerge' &&
+      github.event.pull_request.base.ref == 'develop' &&
+      github.event.pull_request.head.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      # App は bypass 権限を持つため API では未通過でもマージできてしまう。
+      # そこでマージ前に「base ブランチで required 指定されたステータスチェック」が
+      # 全て成功しているかを明示的に検証する（required 以外のチェックは見ない）。
+      - name: Verify required status checks have passed
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          # 1. required なチェック名を取得する。
+          #    ルールセット(/rules/branches) とクラシック branch protection の両方に対応し union を取る。
+          if rs_json="$(gh api "/repos/${REPO}/rules/branches/${BASE_REF}" 2>/dev/null)"; then
+            rs="$(jq '[.[] | select(.type=="required_status_checks")
+                      | .parameters.required_status_checks[].context]' <<< "${rs_json}")"
+          else
+            rs=""
+          fi
+          if bp_json="$(gh api "/repos/${REPO}/branches/${BASE_REF}/protection/required_status_checks" 2>/dev/null)"; then
+            bp="$(jq '[.checks[].context]' <<< "${bp_json}")"
+          else
+            bp=""
+          fi
+          if [ -z "${rs}" ] && [ -z "${bp}" ]; then
+            echo "::error::required ステータスチェックの定義を取得できませんでした。App に該当の read 権限があるか確認してください。"
+            exit 1
+          fi
+          required="$(jq -s 'add | unique' <<< "${rs:-[]}"$'\n'"${bp:-[]}")"
+          echo "::group::Required status checks (${BASE_REF})"
+          jq -r '.[]' <<< "${required}"
+          echo "::endgroup::"
+
+          if [ "$(jq 'length' <<< "${required}")" -eq 0 ]; then
+            echo "required なステータスチェックは設定されていません。検証をスキップしてマージします。"
+            exit 0
+          fi
+
+          # 2. PR head の check rollup を取得する。
+          checks="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json statusCheckRollup \
+            --jq '.statusCheckRollup')"
+
+          # 3. required な各 context について、対応するチェックが成功しているか判定する。
+          #    CheckRun(status/conclusion) と StatusContext(state) の両方を正規化して扱う。
+          report="$(jq -n --argjson required "${required}" --argjson checks "${checks}" '
+            ($checks | map({
+              name: (.name // .context),
+              done: (if .__typename == "CheckRun" then (.status == "COMPLETED")
+                     else ((.state // "") | ascii_upcase) != "PENDING" end),
+              ok:   (if .__typename == "CheckRun"
+                       then (.status == "COMPLETED"
+                             and ((.conclusion // "") | ascii_upcase | IN("SUCCESS","NEUTRAL","SKIPPED")))
+                     else ((.state // "") | ascii_upcase | IN("SUCCESS","EXPECTED")) end)
+            })) as $norm
+            | [ $required[] as $r
+                | ($norm | map(select(.name == $r))) as $m
+                | if   ($m | length) == 0      then {context:$r, status:"missing"}
+                  elif ($m | any(.done | not)) then {context:$r, status:"pending"}
+                  elif ($m | all(.ok))         then {context:$r, status:"success"}
+                  else                              {context:$r, status:"failed"}
+                  end ]
+          ')"
+
+          echo "::group::Required check results"
+          jq -r '.[] | "\(.status)\t\(.context)"' <<< "${report}"
+          echo "::endgroup::"
+
+          bad="$(jq -r '[.[] | select(.status != "success") | "\(.context)(\(.status))"] | join(", ")' <<< "${report}")"
+          if [ -n "${bad}" ]; then
+            echo "::error::required ステータスチェックが全て成功していません: ${bad}"
+            exit 1
+          fi
+          echo "required ステータスチェックは全て成功しています。"
+
+      - name: Merge with a merge commit (bypass merge queue)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/merge" \
+            -f merge_method=merge
